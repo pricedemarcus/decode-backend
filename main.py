@@ -7,11 +7,12 @@ import os
 import json
 import tempfile
 import math
+import subprocess
 import numpy as np
 import librosa
 import anthropic
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -217,7 +218,17 @@ Respond with ONLY valid JSON — no markdown, no code fences:
       "tip": "Short tip"
     }}
   ],
-  "insight": "One expert observation about this riff in 1–2 sentences. Mention genre, feel, or what makes it interesting to play."
+  "insight": "One expert observation about this riff in 1–2 sentences. Mention genre, feel, or what makes it interesting to play.",
+  "tone_profile": {{
+    "amp": "e.g. Marshall JCM800",
+    "gain": "e.g. 7/10",
+    "bass": "e.g. 6/10",
+    "mid": "e.g. 4/10",
+    "treble": "e.g. 7/10",
+    "effects": ["e.g. Overdrive", "Light Reverb"],
+    "pickup": "e.g. Bridge humbucker",
+    "notes": "1-2 sentences on how to dial in this tone."
+  }}
 }}"""
 
 
@@ -298,3 +309,102 @@ async def analyze(file: UploadFile = File(...)):
             os.unlink(tmp_path)
         except Exception:
             pass
+
+
+@app.post("/analyze-url")
+async def analyze_url(request: Request):
+    """
+    Accept a YouTube (or other yt-dlp compatible) URL, download the audio,
+    and run the same AI analysis pipeline as /analyze.
+    """
+    body = await request.json()
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_template = os.path.join(tmpdir, "%(id)s.%(ext)s")
+
+        dl_cmd = [
+            "yt-dlp",
+            "-f", "bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio",
+            "--max-filesize", "50m",
+            "--no-playlist",
+            "-o", output_template,
+            url,
+        ]
+        dl = subprocess.run(dl_cmd, capture_output=True, text=True, timeout=90)
+        if dl.returncode != 0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not download audio. Make sure the URL is a public video. ({dl.stderr[-200:]})"
+            )
+
+        files = [f for f in os.listdir(tmpdir) if not f.startswith(".")]
+        if not files:
+            raise HTTPException(status_code=500, detail="Download produced no audio file.")
+
+        audio_path = os.path.join(tmpdir, files[0])
+
+        title_cmd = ["yt-dlp", "--get-title", "--no-playlist", url]
+        title_res = subprocess.run(title_cmd, capture_output=True, text=True, timeout=30)
+        title = title_res.stdout.strip() if title_res.returncode == 0 else "YouTube Riff"
+
+        try:
+            audio_data = analyze_audio(audio_path)
+            prompt = build_prompt(audio_data, title)
+            result = call_claude(prompt)
+            result["duration"] = audio_data["duration"]
+            result["filename"] = title
+            result["raw_tempo"] = audio_data["tempo"]
+            result["source_url"] = url
+            return result
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=500, detail=f"AI response parse error: {e}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    """
+    AI guitar teacher — conversational endpoint.
+    Accepts { messages: [{role, content}], context: {key, tempo, techniques, filename, difficulty} }
+    """
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured.")
+
+    body = await request.json()
+    messages = body.get("messages", [])
+    ctx = body.get("context", {})
+
+    if not messages:
+        raise HTTPException(status_code=400, detail="messages is required")
+
+    techniques_str = ", ".join(ctx.get("techniques", [])) or "unknown"
+    system = f"""You are DECODE's AI guitar teacher — an expert guitarist and music educator with 20 years of teaching experience.
+You are helping a student learn a specific riff that was just analyzed.
+
+Current riff context:
+- Song/File: {ctx.get('filename', 'Unknown')}
+- Key: {ctx.get('key', 'Unknown')}
+- Tempo: {ctx.get('tempo', 'Unknown')} BPM
+- Techniques detected: {techniques_str}
+- Difficulty: {ctx.get('difficulty', 'Unknown')}
+
+Rules:
+- Be encouraging, specific, and practical
+- Keep responses under 4 sentences unless the student asks for detailed explanation
+- Give actionable advice the student can try immediately
+- If asked about technique, describe hand position and motion concisely
+- Reference the specific riff context when relevant"""
+
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=512,
+        system=system,
+        messages=messages,
+    )
+
+    return {"response": response.content[0].text}
